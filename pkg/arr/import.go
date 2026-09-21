@@ -157,9 +157,15 @@ func (a *Arr) Import(downloadID string) error {
 	query.Add("downloadId", downloadID)
 	url := "api/v3/manualimport" + "?" + query.Encode()
 	var data []ImportResponseSchema
-	_, err := a.Request(http.MethodGet, url, nil, &data)
+	resp, err := a.RequestOnce(http.MethodGet, url, nil, &data)
 	if err != nil {
-		return fmt.Errorf("failed to import: %w", err)
+		return fmt.Errorf("failed to inspect import: %w", err)
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("failed to inspect import: %s", resp.Status)
+	}
+	if len(data) == 0 {
+		return fmt.Errorf("failed to inspect import: no files returned")
 	}
 	var files []ManualImportRequestFile
 	for _, d := range data {
@@ -193,8 +199,12 @@ func (a *Arr) Import(downloadID string) error {
 	}
 
 	url = "api/v3/command"
-	if _, err := a.Request(http.MethodPost, url, request, nil); err != nil {
-		return fmt.Errorf("failed to import: %w", err)
+	resp, err = a.RequestOnce(http.MethodPost, url, request, nil)
+	if err != nil {
+		return fmt.Errorf("failed to start import: %w", err)
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("failed to start import: %s", resp.Status)
 	}
 	return nil
 }

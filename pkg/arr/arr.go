@@ -63,6 +63,8 @@ type Arr struct {
 	DownloadUncached *bool  `json:"download_uncached"`
 	SelectedDebrid   string `json:"selected_debrid,omitempty"` // The debrid service selected for this arr
 	Source           Source `json:"source,omitempty"`          // The source of the arr, e.g. "auto", "manual". Auto means it was automatically detected from the arr
+
+	manualImports *manualImportGuard
 }
 
 func New(name, host, token string, skipRepair bool, downloadUncached *bool, selectedDebrid, source string) *Arr {
@@ -75,6 +77,7 @@ func New(name, host, token string, skipRepair bool, downloadUncached *bool, sele
 		DownloadUncached: downloadUncached,
 		SelectedDebrid:   selectedDebrid,
 		Source:           Source(source),
+		manualImports:    newManualImportGuard(),
 	}
 }
 
@@ -82,6 +85,16 @@ func New(name, host, token string, skipRepair bool, downloadUncached *bool, sele
 // cancels the in-flight HTTP call — this is what lets the repair pipeline
 // abort long Sonarr enumerations when a user presses Stop.
 func (a *Arr) RequestCtx(ctx context.Context, method, endpoint string, payload any, res any) (*http.Response, error) {
+	return a.requestCtx(ctx, method, endpoint, payload, res, true)
+}
+
+// RequestOnceCtx issues one HTTP request without transport retries. Use this
+// for endpoints where a timeout does not prove the server stopped processing.
+func (a *Arr) RequestOnceCtx(ctx context.Context, method, endpoint string, payload any, res any) (*http.Response, error) {
+	return a.requestCtx(ctx, method, endpoint, payload, res, false)
+}
+
+func (a *Arr) requestCtx(ctx context.Context, method, endpoint string, payload any, res any, retry bool) (*http.Response, error) {
 	if a.Token == "" || a.Host == "" {
 		return nil, fmt.Errorf("arr not configured")
 	}
@@ -110,7 +123,12 @@ func (a *Arr) RequestCtx(ctx context.Context, method, endpoint string, payload a
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Api-Key", a.Token)
 
-	resp, err := getSharedClient().Do(req)
+	var resp *http.Response
+	if retry {
+		resp, err = getSharedClient().Do(req)
+	} else {
+		resp, err = getSharedClient().DoOnce(req)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -137,6 +155,11 @@ func (a *Arr) RequestCtx(ctx context.Context, method, endpoint string, payload a
 // any code path that should be cancellable (repair, etc.).
 func (a *Arr) Request(method, endpoint string, payload any, res any) (*http.Response, error) {
 	return a.RequestCtx(context.Background(), method, endpoint, payload, res)
+}
+
+// RequestOnce is the no-context shim for a non-retrying request.
+func (a *Arr) RequestOnce(method, endpoint string, payload any, res any) (*http.Response, error) {
+	return a.RequestOnceCtx(context.Background(), method, endpoint, payload, res)
 }
 
 func (a *Arr) Validate() error {
@@ -195,6 +218,12 @@ func (s *Storage) AddOrUpdate(arr *Arr) {
 	// Check the host URL
 	if utils.ValidateURL(arr.Host) != nil {
 		return
+	}
+	if existing, ok := s.arrs.Load(arr.Name); ok {
+		arr.manualImports = existing.manualImports
+	}
+	if arr.manualImports == nil {
+		arr.manualImports = newManualImportGuard()
 	}
 	s.arrs.Store(arr.Name, arr)
 }
@@ -287,6 +316,7 @@ func (s *Storage) SyncFromConfig(arrs []config.Arr) {
 				ac.Host = arr.Host
 			}
 			ac.Token = cmp.Or(ac.Token, arr.Token)
+			ac.manualImports = arr.manualImports
 			newMaps.Store(name, ac)
 		} else {
 			newMaps.Store(name, arr)
@@ -300,15 +330,15 @@ func (s *Storage) Monitor() {
 	wg := sync.WaitGroup{}
 	wg.Add(s.arrs.Size())
 	s.arrs.Range(func(name string, arr *Arr) bool {
-		_, _, _ = s.sg.Do(fmt.Sprintf("cleanup_%s", arr.Name), func() (any, error) {
-			go func() {
-				defer wg.Done()
-				if err := arr.CleanupQueue(); err != nil {
-					s.logger.Error().Err(err).Msgf("Failed to cleanup arr %s", arr.Name)
-				}
-			}()
-			return nil, nil
-		})
+		go func() {
+			defer wg.Done()
+			_, err, _ := s.sg.Do(fmt.Sprintf("cleanup_%s", arr.Name), func() (any, error) {
+				return nil, arr.CleanupQueue()
+			})
+			if err != nil {
+				s.logger.Error().Err(err).Msgf("Failed to cleanup arr %s", arr.Name)
+			}
+		}()
 		return true
 	})
 	wg.Wait()

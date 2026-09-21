@@ -108,6 +108,30 @@ func WithProxy(proxyURL string) ClientOption {
 
 // Do performs an HTTP request with retries for certain status codes
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
+	if err := c.prepare(req); err != nil {
+		return nil, err
+	}
+
+	// Convert to retryablehttp request
+	retryReq, err := retryablehttp.FromRequest(req)
+	if err != nil {
+		return nil, fmt.Errorf("creating retryable request: %w", err)
+	}
+
+	return c.client.Do(retryReq)
+}
+
+// DoOnce performs exactly one HTTP request. It is intended for expensive or
+// side-effecting endpoints where retrying after a transport timeout could
+// duplicate work that the remote server is still processing.
+func (c *Client) DoOnce(req *http.Request) (*http.Response, error) {
+	if err := c.prepare(req); err != nil {
+		return nil, err
+	}
+	return c.httpClient.Do(req)
+}
+
+func (c *Client) prepare(req *http.Request) error {
 	// Apply headers
 	c.headersMu.RLock()
 	if c.headers != nil {
@@ -121,19 +145,12 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	if c.rateLimiter != nil {
 		select {
 		case <-req.Context().Done():
-			return nil, req.Context().Err()
+			return req.Context().Err()
 		default:
 			c.rateLimiter.Take()
 		}
 	}
-
-	// Convert to retryablehttp request
-	retryReq, err := retryablehttp.FromRequest(req)
-	if err != nil {
-		return nil, fmt.Errorf("creating retryable request: %w", err)
-	}
-
-	return c.client.Do(retryReq)
+	return nil
 }
 
 // MakeRequest performs an HTTP request and returns the response body as bytes

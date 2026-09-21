@@ -1,15 +1,58 @@
 package arr
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	gourl "net/url"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/logger"
 )
+
+const (
+	manualImportGlobalCooldown   = 5 * time.Minute
+	manualImportDownloadCooldown = 30 * time.Minute
+)
+
+type manualImportGuard struct {
+	mu          sync.Mutex
+	nextAttempt time.Time
+	lastAttempt map[string]time.Time
+}
+
+func newManualImportGuard() *manualImportGuard {
+	return &manualImportGuard{lastAttempt: make(map[string]time.Time)}
+}
+
+func (g *manualImportGuard) reserve(downloadID string, now time.Time) (bool, time.Duration) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if now.Before(g.nextAttempt) {
+		return false, g.nextAttempt.Sub(now)
+	}
+	if last, ok := g.lastAttempt[downloadID]; ok {
+		ready := last.Add(manualImportDownloadCooldown)
+		if now.Before(ready) {
+			return false, ready.Sub(now)
+		}
+	}
+
+	g.nextAttempt = now.Add(manualImportGlobalCooldown)
+	g.lastAttempt[downloadID] = now
+	for id, attempted := range g.lastAttempt {
+		if now.Sub(attempted) >= manualImportDownloadCooldown {
+			delete(g.lastAttempt, id)
+		}
+	}
+	return true, 0
+}
 
 type QueueAction string
 
@@ -238,11 +281,9 @@ func (a *Arr) CleanupQueue() error {
 		}
 	}
 	if len(manualImports) > 0 {
-		go func() {
-			if err := a.ManualImportItems(manualImports); err != nil {
-				l.Error().Err(err).Str("arr", a.Name).Msg("queue cleanup: manual import failed")
-			}
-		}()
+		if err := a.ManualImportItems(manualImports); err != nil {
+			l.Error().Err(err).Str("arr", a.Name).Msg("queue cleanup: manual import failed")
+		}
 	}
 
 	return nil
@@ -340,11 +381,30 @@ func (a *Arr) removeQueueItems(items map[int]bool, blocklist, skipRedownload boo
 }
 
 func (a *Arr) ManualImportItems(items map[string]bool) error {
-	for downloadId := range items {
-		if err := a.Import(downloadId); err != nil {
-			// log error
-			fmt.Println(err)
+	if a.manualImports == nil {
+		a.manualImports = newManualImportGuard()
+	}
+	l := logger.New("arr")
+
+	ids := make([]string, 0, len(items))
+	for downloadID := range items {
+		if strings.TrimSpace(downloadID) != "" {
+			ids = append(ids, downloadID)
 		}
 	}
-	return nil
+	sort.Strings(ids)
+
+	var errs []error
+	for _, downloadID := range ids {
+		ok, wait := a.manualImports.reserve(downloadID, time.Now())
+		if !ok {
+			l.Debug().Str("arr", a.Name).Str("download_id", downloadID).
+				Dur("retry_in", wait).Msg("manual import deferred by safety cooldown")
+			continue
+		}
+		if err := a.Import(downloadID); err != nil {
+			errs = append(errs, fmt.Errorf("manual import %s: %w", downloadID, err))
+		}
+	}
+	return errors.Join(errs...)
 }
